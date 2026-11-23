@@ -407,8 +407,7 @@ $('#movForm').addEventListener('submit', async e => {
     return;
   }
   const ok = await run(() => store.add([mov]), toGoal ? 'Movimiento añadido y sumado a tu meta' : 'Movimiento añadido');
-  if (ok) { $('#fMonto').value = ''; $('#fDesc').value = ''; $('#fMonto').focus(); }
-});
+if (ok) { $('#fMonto').value = ''; $('#fDesc').value = ''; $('#fCat').value = CATS[0]; $('#fMonto').focus(); }});
 
 /* Editar un movimiento: se carga en el formulario de la izquierda */
 function startEdit(m) {
@@ -425,8 +424,8 @@ function exitEdit() {
   editingId = null;
   $('#movFormTitle').textContent = 'Nuevo movimiento'; $('#movSubmit').textContent = '+ Añadir movimiento'; $('#movCancel').hidden = true;
   $('#fMonto').value = ''; $('#fDesc').value = ''; $('#fFecha').value = todayStr(); setTipo('gasto');
-  setMsg($('#movMsg'), '', '');
-  renderList();
+$('#fMonto').value = ''; $('#fDesc').value = ''; $('#fFecha').value = todayStr(); setTipo('gasto'); $('#fCat').value = CATS[0];
+renderList();
 }
 $('#movCancel').onclick = exitEdit;
 
