@@ -6,6 +6,8 @@
 --   1) Crea las tablas movimientos, presupuestos y metas (si no existen).
 --   2) Activa Row Level Security (RLS) para que cada persona SOLO vea y edite sus propios datos.
 --   3) Crea la función delete_my_account() que usa el botón "Eliminar mi cuenta".
+--   4) Añade las columnas para el historial del presupuesto y los límites por categoría
+--      (si ya habías ejecutado una versión anterior de este archivo, vuelve a ejecutarlo).
 
 -- ========== 1. Tablas ==========
 create table if not exists public.movimientos (
@@ -25,12 +27,21 @@ create table if not exists public.presupuestos (
   semanal    numeric(12,2) not null default 0 check (semanal >= 0 and semanal <= 1000000),
   updated_at timestamptz not null default now()
 );
+-- historial:  presupuesto de cada semana, p. ej. {"2026-11-23": 150}  (clave = lunes de la semana)
+-- categorias: límite semanal por categoría, p. ej. {"Comida": 60, "Entretenimiento": 30}
+alter table public.presupuestos add column if not exists historial  jsonb not null default '{}'::jsonb;
+alter table public.presupuestos add column if not exists categorias jsonb not null default '{}'::jsonb;
+alter table public.presupuestos drop constraint if exists presupuestos_json_ok;
+alter table public.presupuestos add constraint presupuestos_json_ok check (
+  jsonb_typeof(historial) = 'object' and jsonb_typeof(categorias) = 'object'
+  and pg_column_size(historial) < 65536 and pg_column_size(categorias) < 4096
+);
 
 create table if not exists public.metas (
   user_id    uuid primary key default auth.uid() references auth.users(id) on delete cascade,
   nombre     text not null default '' check (char_length(nombre) <= 60),
   objetivo   numeric(14,2) not null default 0 check (objetivo >= 0 and objetivo <= 100000000),
-  ahorrado   numeric(14,2) not null default 0 check (ahorrado >= 0 and ahorrado <= 100000000),
+  ahorrado   numeric(14,2) not null default 0 check (ahorrado >= 0 and ahorrado <= 100000000),  -- ahorro inicial (antes de usar la app); la app le suma los movimientos de "Ahorro"
   updated_at timestamptz not null default now()
 );
 
@@ -84,6 +95,9 @@ $$;
 
 revoke all on function public.delete_my_account() from public, anon;
 grant execute on function public.delete_my_account() to authenticated;
+
+-- Avisa a la API de Supabase que hay columnas nuevas
+notify pgrst, 'reload schema';
 
 -- ========== Comprobación ==========
 -- Después de ejecutar, esta consulta debe mostrar "true" en las tres tablas:

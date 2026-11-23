@@ -8,14 +8,18 @@
 <meta name="theme-color" content="#035466">
 <link rel="icon" type="image/png" href="favicon.png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="canonical" href="https://balanceyoung.netlify.app/">
+<meta name="apple-mobile-web-app-title" content="Balance Young">
+<meta name="mobile-web-app-capable" content="yes">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Balance Young — Tu dinero, tu ritmo, tu futuro">
 <meta property="og:description" content="Organiza tu dinero semana a semana. Gratis y pensado para jóvenes adultos (18+) en Perú.">
-<meta property="og:image" content="https://balanceyoung.netlify.app/og-image.png">
+<meta property="og:image" content="https://balanceyoung.netlify.app/og-image.jpg">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:image" content="https://balanceyoung.netlify.app/og-image.png">
+<meta name="twitter:image" content="https://balanceyoung.netlify.app/og-image.jpg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -123,7 +127,7 @@ textarea{min-height:100px;resize:vertical}
 .tools select{flex:0 0 140px}
 .toolbtns{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
 ul.movs{list-style:none;margin:0;padding:0;display:grid;gap:8px;max-height:460px;overflow:auto}
-.mov{display:grid;grid-template-columns:42px 1fr auto 30px;gap:12px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:14px;background:#fff}
+.mov{display:grid;grid-template-columns:42px 1fr auto auto;gap:12px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:14px;background:#fff}
 .mov-ico{width:42px;height:42px;border-radius:12px;background:var(--brand-l);display:grid;place-items:center;font-size:1.2rem}
 .mov-main{min-width:0}
 .mov-main strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -132,6 +136,19 @@ ul.movs{list-style:none;margin:0;padding:0;display:grid;gap:8px;max-height:460px
 .mov-amt.ingreso{color:var(--ok)} .mov-amt.gasto{color:var(--bad)}
 .icon-btn{border:0;background:transparent;cursor:pointer;color:var(--muted);border-radius:8px;width:30px;height:30px;font-size:.9rem}
 .icon-btn:hover{background:#fdecef;color:var(--bad)}
+.mov-acts{display:flex;gap:2px}
+.icon-btn.edit:hover{background:var(--brand-l);color:var(--brand-d)}
+.mov.editing{border-color:var(--brand);box-shadow:0 0 0 2px var(--brand-l)}
+.sub-h{font-size:1rem;margin:24px 0 6px;padding-top:18px;border-top:1px solid var(--line)}
+.cat-limits{display:grid;gap:10px;margin-top:10px}
+.cl-row{display:grid;grid-template-columns:130px 1fr 96px;gap:10px;align-items:center;font-size:.9rem}
+.cl-row .bar{margin:0}
+.cl-row small{display:block;color:var(--muted);font-size:.78rem;margin-top:4px}
+.cl-row small.over{color:var(--bad);font-weight:700}
+.cl-row input{padding:7px 9px}
+@media(max-width:560px){.cl-row{grid-template-columns:96px 1fr 80px}}
+.per-seg{max-width:240px;margin-bottom:14px}
+.panel .btn.ghost.block{margin-top:8px}
 .empty{text-align:center;color:var(--muted);padding:34px 10px;border:2px dashed var(--line);border-radius:14px}
 .rep-row{display:grid;grid-template-columns:130px 1fr 90px;gap:10px;align-items:center;margin:10px 0;font-size:.92rem}
 .rep-row .bar{margin:0}
@@ -232,6 +249,7 @@ footer a{color:var(--brand);font-weight:600}
         <div class="hero-cta">
           <a class="btn" href="#organizador">Organizar mi dinero</a>
           <a class="btn ghost" href="#planes">Ver planes</a>
+          <button class="btn ghost" id="btnInstall" type="button" hidden>📲 Instalar la app</button>
         </div>
       </div>
 
@@ -269,7 +287,7 @@ footer a{color:var(--brand);font-weight:600}
 
       <div class="org-grid">
         <form class="panel" id="movForm" autocomplete="off" novalidate>
-          <h3>Nuevo movimiento</h3>
+          <h3 id="movFormTitle">Nuevo movimiento</h3>
           <div class="seg" role="group" aria-label="Tipo de movimiento">
             <button type="button" id="tGasto" aria-pressed="true">Gasto</button>
             <button type="button" id="tIngreso" aria-pressed="false">Ingreso</button>
@@ -282,7 +300,8 @@ footer a{color:var(--brand);font-weight:600}
           <input id="fDesc" type="text" maxlength="80" placeholder="Ej. Almuerzo, pasajes, pago…">
           <label for="fCat">Categoría</label>
           <select id="fCat"></select>
-          <button class="btn block" type="submit">+ Añadir movimiento</button>
+          <button class="btn block" type="submit" id="movSubmit">+ Añadir movimiento</button>
+          <button class="btn ghost block" type="button" id="movCancel" hidden>Cancelar edición</button>
           <div class="msg" id="movMsg" role="status"></div>
           <p class="hint">Los gastos en la categoría “Ahorro” se suman a tu meta de ahorro.</p>
           <div class="account-zone" id="accountZone" hidden>
@@ -325,9 +344,18 @@ footer a{color:var(--brand);font-weight:600}
             <div class="budget-line"><span id="bUsedTxt">Sin presupuesto definido</span><span id="bPct">0%</span></div>
             <div class="bar"><i id="bFill"></i></div>
             <p class="hint" id="bHint">Define un monto para ver cuánto te queda esta semana.</p>
+
+            <h3 class="sub-h">Límites por categoría <span class="label-note">(opcional)</span></h3>
+            <p class="hint" style="margin-top:0">Ponle un tope semanal a las categorías que quieras controlar. Deja en blanco las demás.</p>
+            <div id="catLimits" class="cat-limits"></div>
+            <button class="btn ghost sm" id="clSave" type="button" style="margin-top:12px">Guardar límites</button>
           </div>
 
           <div id="paneRep" role="tabpanel" aria-labelledby="tabRep" hidden>
+            <div class="seg per-seg" role="group" aria-label="Periodo del reporte">
+              <button type="button" id="pWeek" aria-pressed="true">Semana</button>
+              <button type="button" id="pMonth" aria-pressed="false">Mes</button>
+            </div>
             <div class="sum3">
               <div class="stat in"><b id="rIn">—</b><span>Ingresos</span></div>
               <div class="stat out"><b id="rOut">—</b><span>Gastos</span></div>
@@ -335,6 +363,7 @@ footer a{color:var(--brand);font-weight:600}
             </div>
             <h3 style="font-size:1rem;margin-bottom:6px" id="repTitle">Gastos por categoría (esta semana)</h3>
             <div id="repCats"></div>
+            <p class="hint" id="repCompare"></p>
           </div>
         </div>
       </div>
@@ -399,8 +428,9 @@ footer a{color:var(--brand);font-weight:600}
           <input id="gName" type="text" maxlength="60" placeholder="Ej. Laptop, viaje, fondo de emergencia">
           <div class="row2">
             <div><label for="gTarget">Meta (S/)</label><input id="gTarget" type="number" inputmode="decimal" step="0.01" min="0" max="100000000" placeholder="0.00"></div>
-            <div><label for="gSaved">Ya ahorrado (S/)</label><input id="gSaved" type="number" inputmode="decimal" step="0.01" min="0" max="100000000" placeholder="0.00"></div>
+            <div><label for="gSaved">Ahorro inicial (S/)</label><input id="gSaved" type="number" inputmode="decimal" step="0.01" min="0" max="100000000" placeholder="0.00"></div>
           </div>
+          <p class="hint">El ahorro inicial es lo que ya tenías antes de usar Balance Young. Todo lo que registres en la categoría “Ahorro” se suma solo a tu meta.</p>
           <button class="btn block" type="submit">Guardar mi meta</button>
           <div class="msg" id="goalMsg" role="status"></div>
         </form>
