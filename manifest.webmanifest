@@ -1,0 +1,16 @@
+{
+  "name": "Balance Young",
+  "short_name": "Balance Young",
+  "description": "Organiza tu dinero semana a semana: ingresos, gastos, presupuesto y metas de ahorro.",
+  "lang": "es-PE",
+  "start_url": "/?app=1",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8fbfa",
+  "theme_color": "#035466",
+  "icons": [
+    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}

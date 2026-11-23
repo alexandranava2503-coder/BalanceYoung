@@ -38,6 +38,12 @@ function weekRange(offset = 0) {
   const e = new Date(s); e.setDate(s.getDate() + 6);
   return [ymd(s), ymd(e), idx];
 }
+/* Rango del mes. offset = 0 es este mes, -1 el anterior, etc. */
+function monthRange(offset = 0) {
+  const d = new Date();
+  const s = new Date(d.getFullYear(), d.getMonth() + offset, 1), e = new Date(d.getFullYear(), d.getMonth() + offset + 1, 0);
+  return [ymd(s), ymd(e)];
+}
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : 'id-' + Date.now() + '-' + Math.random().toString(16).slice(2));
 const num = v => { const n = parseFloat(String(v).replace(',', '.')); return Number.isFinite(n) ? n : NaN; };
 
@@ -96,14 +102,21 @@ function confirmBox({title, text, ok = 'Aceptar', danger = false}) {
 /* ============ Estado y almacenamiento ============ */
 let user = null;
 const emptyGoal = () => ({nombre: '', objetivo: 0, ahorrado: 0});
-const state = {movs: [], budget: 0, goal: emptyGoal(), loaded: false};
+const state = {movs: [], budget: 0, hist: {}, catLim: {}, goal: emptyGoal(), loaded: false};
+const objOr = v => (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
 
 const LS = {
   get(k, def) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch { return def; } },
   set(k, v)   { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   del(k)      { try { localStorage.removeItem(k); } catch {} }
 };
-const normMov = r => ({id: String(r.id), tipo: r.tipo, monto: Number(r.monto), descripcion: r.descripcion || '', categoria: r.categoria, fecha: String(r.fecha).slice(0, 10)});
+const normMov = r => ({id: String(r.id), tipo: r.tipo, monto: Number(r.monto), descripcion: r.descripcion || '', categoria: r.categoria, fecha: String(r.fecha).slice(0, 10), ...(r.demo ? {demo: true} : {})});
+const cleanMov = ({tipo, monto, descripcion, categoria, fecha}) => ({tipo, monto, descripcion, categoria, fecha});
+
+/* Error con un mensaje pensado para la persona usuaria */
+const userErr = (text, cause) => Object.assign(new Error(text), {userMsg: text, cause});
+/* Si la base de datos aún no tiene las columnas nuevas (falta ejecutar schema.sql) */
+const missingColumn = err => err && (err.code === 'PGRST204' || err.code === '42703' || /column/i.test(err.message || ''));
 const sortMovs = a => a.sort((x, y) => y.fecha.localeCompare(x.fecha));
 
 const store = {
@@ -111,29 +124,37 @@ const store = {
     if (user && sb) {
       const [m, b, g] = await Promise.all([
         sb.from('movimientos').select('*').order('fecha', {ascending: false}).order('created_at', {ascending: false}),
-        sb.from('presupuestos').select('semanal').maybeSingle(),
+        sb.from('presupuestos').select('*').maybeSingle(),
         sb.from('metas').select('nombre,objetivo,ahorrado').maybeSingle()
       ]);
       if (m.error) throw m.error;
       state.movs = m.data.map(normMov);
       state.budget = Number(b.data?.semanal || 0);
+      state.hist = objOr(b.data?.historial);
+      state.catLim = objOr(b.data?.categorias);
       state.goal = g.data ? {nombre: g.data.nombre || '', objetivo: Number(g.data.objetivo), ahorrado: Number(g.data.ahorrado)} : emptyGoal();
     } else {
       state.movs = sortMovs((LS.get('by_movs', []) || []).map(normMov));
       state.budget = Number(LS.get('by_budget', 0)) || 0;
+      state.hist = objOr(LS.get('by_budget_hist', {}));
+      state.catLim = objOr(LS.get('by_cat_limits', {}));
       state.goal = Object.assign(emptyGoal(), LS.get('by_goal', {}));
     }
     state.loaded = true;
   },
   async add(list) {
     if (user && sb) {
-      const rows = list.map(m => ({user_id: user.id, tipo: m.tipo, monto: m.monto, descripcion: m.descripcion, categoria: m.categoria, fecha: m.fecha}));
+      const rows = list.map(m => ({user_id: user.id, ...cleanMov(m)}));
       const {error} = await sb.from('movimientos').insert(rows); if (error) throw error;
     } else {
       const cur = LS.get('by_movs', []) || [];
-      list.forEach(m => cur.push({id: uid(), ...m}));
+      list.forEach(m => cur.push({id: uid(), ...cleanMov(m), ...(m.demo ? {demo: true} : {})}));
       LS.set('by_movs', sortMovs(cur));
     }
+  },
+  async update(id, m) {
+    if (user && sb) { const {error} = await sb.from('movimientos').update(cleanMov(m)).eq('id', id); if (error) throw error; }
+    else LS.set('by_movs', sortMovs((LS.get('by_movs', []) || []).map(x => String(x.id) === String(id) ? {id: x.id, ...cleanMov(m)} : x)));
   },
   async remove(id) {
     if (user && sb) { const {error} = await sb.from('movimientos').delete().eq('id', id); if (error) throw error; }
@@ -143,9 +164,23 @@ const store = {
     if (user && sb) { const {error} = await sb.from('movimientos').delete().eq('user_id', user.id); if (error) throw error; }
     else LS.set('by_movs', []);
   },
+  /* Guarda el presupuesto de esta semana y lo anota en el historial,
+     así las semanas pasadas conservan el presupuesto que tenían. */
   async saveBudget(n) {
-    if (user && sb) { const {error} = await sb.from('presupuestos').upsert({user_id: user.id, semanal: n, updated_at: new Date().toISOString()}); if (error) throw error; }
-    else LS.set('by_budget', n);
+    const hist = {...state.hist, [weekRange(0)[0]]: n};
+    if (user && sb) {
+      const base = {user_id: user.id, semanal: n, updated_at: new Date().toISOString()};
+      let {error} = await sb.from('presupuestos').upsert({...base, historial: hist});
+      if (missingColumn(error)) ({error} = await sb.from('presupuestos').upsert(base));   // base de datos sin actualizar: guarda solo el monto
+      if (error) throw error;
+    } else { LS.set('by_budget', n); LS.set('by_budget_hist', hist); }
+  },
+  async saveCatLimits(lim) {
+    if (user && sb) {
+      const {error} = await sb.from('presupuestos').upsert({user_id: user.id, semanal: state.budget, categorias: lim, updated_at: new Date().toISOString()});
+      if (missingColumn(error)) throw userErr('Para guardar límites por categoría hay que actualizar la base de datos (ejecutar schema.sql en Supabase).', error);
+      if (error) throw error;
+    } else LS.set('by_cat_limits', lim);
   },
   async saveGoal(g) {
     if (user && sb) { const {error} = await sb.from('metas').upsert({user_id: user.id, nombre: g.nombre, objetivo: g.objetivo, ahorrado: g.ahorrado, updated_at: new Date().toISOString()}); if (error) throw error; }
@@ -155,13 +190,17 @@ const store = {
 
 async function run(fn, okMsg) {
   try { await fn(); await store.load(); renderAll(); if (okMsg) toast(okMsg); return true; }
-  catch (err) { console.error(err); toast('No se pudo completar la acción. Revisa tu conexión e inténtalo otra vez.'); return false; }
+  catch (err) { console.error(err); toast(err.userMsg || 'No se pudo completar la acción. Revisa tu conexión e inténtalo otra vez.'); return false; }
 }
 
 /* ============ Cálculos ============ */
-let weekOff = 0;   // semana que se ve en Presupuesto y Reporte
-function calc(offset = 0) {
-  const [ws, we] = weekRange(offset);
+let weekOff = 0;    // semana que se ve en Presupuesto y Reporte
+let monthOff = 0;   // mes que se ve en Reporte (vista mensual)
+let per = 'week';   // periodo del reporte: 'week' o 'month'
+let activeTab = 'tabMov';
+let editingId = null;   // movimiento que se está editando
+function calc(offset = 0, range = weekRange(offset)) {
+  const [ws, we] = range;
   const inW = m => m.fecha >= ws && m.fecha <= we;
   let tIn = 0, tOut = 0, tSave = 0, wIn = 0, wOut = 0, wSave = 0;
   const byCat = {};
@@ -175,6 +214,15 @@ function calc(offset = 0) {
     }
   }
   return {avail: tIn - tOut - tSave, wIn, wOut, wSave, byCat};
+}
+/* Presupuesto que tenía una semana: el último guardado antes (o durante) esa semana. */
+function budgetFor(offset) {
+  if (offset >= 0) return state.budget;
+  const ws = weekRange(offset)[0], keys = Object.keys(state.hist).sort();
+  if (!keys.length) return state.budget;                 // sin historial: usa el actual
+  let v = Number(state.hist[keys[0]]) || 0;              // antes del primer registro: el más antiguo
+  for (const k of keys) if (k <= ws) v = Number(state.hist[k]) || 0;
+  return v;
 }
 
 /* ============ Render ============ */
@@ -203,11 +251,11 @@ function renderList() {
     return;
   }
   ul.innerHTML = list.map(m => `
-    <li class="mov">
+    <li class="mov${m.id === editingId ? ' editing' : ''}">
       <span class="mov-ico" aria-hidden="true">${ICONS[m.categoria] || '✨'}</span>
       <div class="mov-main"><strong>${esc(m.descripcion || m.categoria)}</strong><small>${esc(m.categoria)} · ${esc(fmtDate(m.fecha))}</small></div>
       <span class="mov-amt ${m.tipo === 'ingreso' ? 'ingreso' : 'gasto'}">${m.tipo === 'ingreso' ? '+' : '−'}${money(m.monto)}</span>
-      <button class="icon-btn" data-del="${esc(m.id)}" aria-label="Eliminar movimiento">✕</button>
+      <span class="mov-acts"><button class="icon-btn edit" type="button" data-edit="${esc(m.id)}" aria-label="Editar movimiento" title="Editar">✎</button><button class="icon-btn" type="button" data-del="${esc(m.id)}" aria-label="Eliminar movimiento" title="Eliminar">✕</button></span>
     </li>`).join('');
 }
 
@@ -217,43 +265,98 @@ function weekLabel(offset) {
   const [ws, we] = weekRange(offset);
   return `Semana del ${fmtDate(ws)} al ${fmtDate(we)}`;
 }
+function monthLabel(offset) {
+  if (offset === 0) return 'Este mes';
+  if (offset === -1) return 'Mes pasado';
+  const t = new Date(monthRange(offset)[0] + 'T00:00:00').toLocaleDateString('es-PE', {month: 'long', year: 'numeric'});
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+const monthMode = () => activeTab === 'tabRep' && per === 'month';
 function renderWeekNav() {
-  $('#wkLabel').textContent = weekLabel(weekOff);
-  $('#wkNext').disabled = weekOff >= 0;
+  const mm = monthMode(), off = mm ? monthOff : weekOff;
+  $('#wkLabel').textContent = mm ? monthLabel(off) : weekLabel(off);
+  $('#wkNext').disabled = off >= 0;
+  $('#wkPrev').setAttribute('aria-label', mm ? 'Mes anterior' : 'Semana anterior');
+  $('#wkNext').setAttribute('aria-label', mm ? 'Mes siguiente' : 'Semana siguiente');
+  $('#pWeek').setAttribute('aria-pressed', per === 'week'); $('#pMonth').setAttribute('aria-pressed', per === 'month');
 }
 
 function renderBudget() {
-  const c = calc(weekOff), cur = weekOff === 0;
+  const c = calc(weekOff), cur = weekOff === 0, bud = budgetFor(weekOff);
   const inp = $('#bInput'); if (document.activeElement !== inp) inp.value = state.budget > 0 ? state.budget : '';
-  const pct = state.budget > 0 ? (c.wOut / state.budget) * 100 : 0;
+  renderCatLimits(c);
+  const pct = bud > 0 ? (c.wOut / bud) * 100 : 0;
   $('#bPct').textContent = Math.round(pct) + '%'; setBar($('#bFill'), pct);
-  if (state.budget <= 0) { $('#bUsedTxt').textContent = 'Sin presupuesto definido'; $('#bHint').textContent = 'Define un monto para ver cuánto te queda esta semana.'; return; }
-  $('#bUsedTxt').textContent = `${money(c.wOut)} gastados de ${money(state.budget)}`;
-  const left = state.budget - c.wOut;
+  if (bud <= 0) { $('#bUsedTxt').textContent = cur ? 'Sin presupuesto definido' : 'Esa semana no tenías presupuesto'; $('#bHint').textContent = cur ? 'Define un monto para ver cuánto te queda esta semana.' : ''; return; }
+  $('#bUsedTxt').textContent = `${money(c.wOut)} gastados de ${money(bud)}`;
+  const left = bud - c.wOut;
   $('#bHint').textContent = cur
     ? (left >= 0 ? `Te quedan ${money(left)} para esta semana.` : `Te pasaste por ${money(-left)} esta semana.`)
-    : (left >= 0 ? `Esa semana te sobraron ${money(left)} de tu presupuesto actual.` : `Esa semana te pasaste por ${money(-left)} de tu presupuesto actual.`);
+    : (left >= 0 ? `Esa semana te sobraron ${money(left)}.` : `Esa semana te pasaste por ${money(-left)}.`);
 }
 
+/* Límites por categoría */
+const LIM_CATS = CATS.filter(c => c !== 'Ahorro');
+$('#catLimits').innerHTML = LIM_CATS.map((c, i) => `
+  <div class="cl-row">
+    <label for="cl${i}" style="margin:0">${ICONS[c]} ${esc(c)}</label>
+    <div><div class="bar"><i id="clFill${i}"></i></div><small id="clTxt${i}">Sin límite</small></div>
+    <input id="cl${i}" type="number" inputmode="decimal" step="0.01" min="0" max="1000000" placeholder="S/ —" aria-label="Límite semanal para ${esc(c)} (S/)">
+  </div>`).join('');
+function renderCatLimits(c) {
+  LIM_CATS.forEach((cat, i) => {
+    const lim = Number(state.catLim[cat]) || 0, spent = c.byCat[cat] || 0, inp = $('#cl' + i), txt = $('#clTxt' + i);
+    if (document.activeElement !== inp) inp.value = lim > 0 ? lim : '';
+    const pct = lim > 0 ? (spent / lim) * 100 : 0;
+    setBar($('#clFill' + i), pct);
+    txt.className = lim > 0 && spent > lim ? 'over' : '';
+    txt.textContent = lim > 0
+      ? (spent > lim ? `${money(spent)} de ${money(lim)} · te pasaste por ${money(spent - lim)}` : `${money(spent)} de ${money(lim)}`)
+      : (spent > 0 ? `${money(spent)} · sin límite` : 'Sin límite');
+  });
+}
+$('#clSave').onclick = () => {
+  const lim = {};
+  for (let i = 0; i < LIM_CATS.length; i++) {
+    const raw = $('#cl' + i).value.trim(); if (!raw) continue;
+    const n = num(raw);
+    if (!(n >= 0) || n > 1e6) return toast(`Revisa el límite de ${LIM_CATS[i]}.`);
+    if (n > 0) lim[LIM_CATS[i]] = Math.round(n * 100) / 100;
+  }
+  run(() => store.saveCatLimits(lim), 'Límites guardados');
+};
+
 function renderReport() {
-  const c = calc(weekOff);
-  $('#repTitle').textContent = weekOff === 0 ? 'Gastos por categoría (esta semana)' : `Gastos por categoría (${weekLabel(weekOff).toLowerCase()})`;
+  const mm = per === 'month', off = mm ? monthOff : weekOff;
+  const c = mm ? calc(0, monthRange(off)) : calc(off);
+  const prev = mm ? calc(0, monthRange(off - 1)) : calc(off - 1);
+  const lbl = mm ? monthLabel(off) : weekLabel(off);
+  $('#repTitle').textContent = `Gastos por categoría (${off === 0 || off === -1 ? lbl.toLowerCase() : lbl})`;
+  const unit = mm ? 'el mes anterior' : 'la semana anterior';
+  $('#repCompare').textContent = !(c.wOut > 0) || !(prev.wOut > 0) ? ''
+    : Math.abs(c.wOut - prev.wOut) < 0.005 ? `Gastaste lo mismo que ${unit}.`
+    : c.wOut > prev.wOut ? `Gastaste ${Math.round((c.wOut / prev.wOut - 1) * 100)}% más que ${unit} (${money(prev.wOut)}).`
+    : `Gastaste ${Math.round((1 - c.wOut / prev.wOut) * 100)}% menos que ${unit} (${money(prev.wOut)}). ¡Bien!`;
   $('#rIn').textContent = money(c.wIn); $('#rOut').textContent = money(c.wOut); $('#rNet').textContent = money(c.wIn - c.wOut - c.wSave);
   const entries = Object.entries(c.byCat).sort((a, b) => b[1] - a[1]);
   const max = entries.length ? entries[0][1] : 0;
   $('#repCats').innerHTML = entries.length
     ? entries.map(([k, v]) => `<div class="rep-row"><span>${esc(ICONS[k] || '')} ${esc(k)}</span><div class="bar"><i style="width:${max ? (v / max) * 100 : 0}%"></i></div><b>${esc(money(v))}</b></div>`).join('')
-    : `<div class="empty">${weekOff === 0 ? 'Todavía no hay gastos esta semana.' : 'No hubo gastos esa semana.'}</div>`;
+    : `<div class="empty">${off === 0 ? (mm ? 'Todavía no hay gastos este mes.' : 'Todavía no hay gastos esta semana.') : (mm ? 'No hubo gastos ese mes.' : 'No hubo gastos esa semana.')}</div>`;
 }
 
+/* Lo ahorrado = ahorro inicial + todos los movimientos de la categoría "Ahorro".
+   Así la meta siempre coincide con tus movimientos (al editar, borrar o borrar todo). */
+const savedIn = list => list.reduce((t, m) => t + (m.tipo === 'gasto' && m.categoria === 'Ahorro' ? m.monto : 0), 0);
+const goalSaved = () => Math.round(((Number(state.goal.ahorrado) || 0) + savedIn(state.movs)) * 100) / 100;
 function renderGoal() {
-  const g = state.goal, has = g.objetivo > 0;
-  const pct = has ? Math.min(100, (g.ahorrado / g.objetivo) * 100) : 0;
+  const g = state.goal, has = g.objetivo > 0, saved = goalSaved();
+  const pct = has ? Math.min(100, (saved / g.objetivo) * 100) : 0;
   $('#gTitle').textContent = g.nombre || (has ? 'Mi meta' : 'Aún no tienes una meta');
   $('#gPct').textContent = Math.round(pct) + '%';
   $('#gFill').style.width = pct + '%';
-  $('#gSavedTxt').textContent = `${money(g.ahorrado)} ahorrados`;
-  $('#gLeftTxt').textContent = !has ? '—' : g.ahorrado >= g.objetivo ? '¡Meta cumplida! 🎉' : `Te faltan ${money(g.objetivo - g.ahorrado)}`;
+  $('#gSavedTxt').textContent = `${money(saved)} ahorrados`;
+  $('#gLeftTxt').textContent = !has ? '—' : saved >= g.objetivo ? '¡Meta cumplida! 🎉' : `Te faltan ${money(g.objetivo - saved)}`;
   if (document.activeElement !== $('#gName')) $('#gName').value = g.nombre || '';
   if (document.activeElement !== $('#gTarget')) $('#gTarget').value = g.objetivo || '';
   if (document.activeElement !== $('#gSaved')) $('#gSaved').value = g.ahorrado || '';
@@ -270,6 +373,7 @@ function renderAuth() {
   }
   $('#demoBar').hidden = CLOUD;
   $('#accountZone').hidden = !(CLOUD && user);
+  $('#btnDemo').hidden = !!(CLOUD && user);   // con cuenta no se mezclan datos falsos con los reales
   $('#orgLead').textContent = !CLOUD ? 'Tus movimientos se guardan solo en este navegador (modo demo).'
     : user ? 'Tus movimientos están guardados en tu cuenta y los ves desde cualquier dispositivo.'
     : 'Puedes probar ahora; crea una cuenta gratis para guardar tus datos y verlos desde cualquier dispositivo.';
@@ -277,16 +381,6 @@ function renderAuth() {
 
 function renderAll() { renderAuth(); renderBalance(); renderList(); renderWeekNav(); renderBudget(); renderReport(); renderGoal(); }
 
-/* ============ Ahorro conectado con la meta ============ */
-// Los gastos en la categoría "Ahorro" suman (o restan, al borrarlos) a la meta.
-const savedIn = list => list.reduce((t, m) => t + (m.tipo === 'gasto' && m.categoria === 'Ahorro' ? m.monto : 0), 0);
-async function shiftGoal(delta) {
-  if (!delta || !(state.goal.objetivo > 0)) return;
-  const ahorrado = Math.max(0, Math.round((state.goal.ahorrado + delta) * 100) / 100);
-  await store.saveGoal({...state.goal, ahorrado});
-}
-async function addMovs(list) { await store.add(list); await shiftGoal(savedIn(list)); }
-async function removeMov(m) { await store.remove(m.id); await shiftGoal(-savedIn([m])); }
 
 /* ============ Formulario de movimientos ============ */
 let tipo = 'gasto';
@@ -306,22 +400,52 @@ $('#movForm').addEventListener('submit', async e => {
   setMsg(msg, '', '');
   const mov = {tipo, monto: Math.round(monto * 100) / 100, descripcion: desc, categoria: cat, fecha};
   const toGoal = savedIn([mov]) > 0 && state.goal.objetivo > 0;
-  const ok = await run(() => addMovs([mov]), toGoal ? 'Movimiento añadido y sumado a tu meta' : 'Movimiento añadido');
+  if (editingId) {
+    const id = editingId;
+    const ok = await run(() => store.update(id, mov), 'Movimiento actualizado');
+    if (ok) exitEdit();
+    return;
+  }
+  const ok = await run(() => store.add([mov]), toGoal ? 'Movimiento añadido y sumado a tu meta' : 'Movimiento añadido');
   if (ok) { $('#fMonto').value = ''; $('#fDesc').value = ''; $('#fMonto').focus(); }
 });
 
+/* Editar un movimiento: se carga en el formulario de la izquierda */
+function startEdit(m) {
+  editingId = m.id;
+  setTipo(m.tipo);
+  $('#fMonto').value = m.monto; $('#fFecha').value = m.fecha; $('#fDesc').value = m.descripcion; $('#fCat').value = m.categoria;
+  $('#movFormTitle').textContent = 'Editar movimiento'; $('#movSubmit').textContent = 'Guardar cambios'; $('#movCancel').hidden = false;
+  setMsg($('#movMsg'), '', '');
+  renderList();
+  $('#movForm').scrollIntoView({behavior: 'smooth', block: 'start'});
+  setTimeout(() => $('#fMonto').focus({preventScroll: true}), 250);
+}
+function exitEdit() {
+  editingId = null;
+  $('#movFormTitle').textContent = 'Nuevo movimiento'; $('#movSubmit').textContent = '+ Añadir movimiento'; $('#movCancel').hidden = true;
+  $('#fMonto').value = ''; $('#fDesc').value = ''; $('#fFecha').value = todayStr(); setTipo('gasto');
+  setMsg($('#movMsg'), '', '');
+  renderList();
+}
+$('#movCancel').onclick = exitEdit;
+
 $('#movList').addEventListener('click', e => {
+  const ed = e.target.closest('[data-edit]');
+  if (ed) { const m = state.movs.find(x => String(x.id) === ed.dataset.edit); if (m) startEdit(m); return; }
   const b = e.target.closest('[data-del]'); if (!b) return;
   const m = state.movs.find(x => String(x.id) === b.dataset.del); if (!m) return;
   const {tipo, monto, descripcion, categoria, fecha} = m;
-  run(() => removeMov(m)).then(ok => {
-    if (ok) toast('Movimiento eliminado', {label: 'Deshacer', fn: () => run(() => addMovs([{tipo, monto, descripcion, categoria, fecha}]), 'Movimiento recuperado')});
+  if (editingId === m.id) exitEdit();
+  run(() => store.remove(m.id)).then(ok => {
+    if (ok) toast('Movimiento eliminado', {label: 'Deshacer', fn: () => run(() => store.add([{tipo, monto, descripcion, categoria, fecha, ...(m.demo ? {demo: true} : {})}]), 'Movimiento recuperado')});
   });
 });
 $('#qSearch').addEventListener('input', renderList);
 $('#qType').addEventListener('change', renderList);
 
 $('#btnDemo').onclick = async () => {
+  if (CLOUD && user) return;   // nunca se guardan datos de ejemplo en una cuenta real
   const [ws, , idx] = weekRange();
   const start = new Date(ws + 'T00:00:00');
   const at = off => { const d = new Date(start); d.setDate(start.getDate() + Math.min(off, idx)); return ymd(d); };
@@ -330,14 +454,14 @@ $('#btnDemo').onclick = async () => {
     ['gasto', 12, 'Almuerzo menú', 'Comida', 0], ['gasto', 8, 'Pasajes', 'Transporte', 0],
     ['gasto', 6.5, 'Fotocopias', 'Estudios', 1], ['gasto', 25, 'Cine con amigos', 'Entretenimiento', 2],
     ['gasto', 5, 'Snack', 'Comida', 2], ['gasto', 20, 'Alcancía', 'Ahorro', 3]
-  ].map(([t, m, d, c, o]) => ({tipo: t, monto: m, descripcion: d, categoria: c, fecha: at(o)}));
-  run(() => addMovs(S), 'Datos de ejemplo añadidos');
+  ].map(([t, m, d, c, o]) => ({tipo: t, monto: m, descripcion: d, categoria: c, fecha: at(o), demo: true}));
+  run(() => store.add(S), 'Datos de ejemplo añadidos (no se pasan a tu cuenta si te registras)');
 };
 
 $('#btnClear').onclick = async () => {
   if (!state.movs.length) return toast('No hay movimientos para borrar.');
-  const ok = await confirmBox({title: '¿Borrar todos los movimientos?', text: 'Se borrarán tus movimientos. Tu presupuesto y tu meta se mantienen. Esta acción no se puede deshacer.', ok: 'Sí, borrar', danger: true});
-  if (ok) run(() => store.clear(), 'Movimientos borrados');
+  const ok = await confirmBox({title: '¿Borrar todos los movimientos?', text: 'Se borrarán tus movimientos. Tu presupuesto y tu meta se mantienen, pero lo ahorrado en la meta bajará porque también se borran tus movimientos de ahorro. Esta acción no se puede deshacer.', ok: 'Sí, borrar', danger: true});
+  if (ok) { if (editingId) exitEdit(); run(() => store.clear(), 'Movimientos borrados'); }
 };
 
 function csvCell(v) {
@@ -362,7 +486,9 @@ function selectTab(id, focus) {
     const on = t === id, tb = $('#' + t);
     tb.setAttribute('aria-selected', on); tb.tabIndex = on ? 0 : -1; $('#' + p).hidden = !on;
   });
+  activeTab = id;
   $('#weekNav').hidden = id === 'tabMov';
+  renderWeekNav();
   if (focus) $('#' + id).focus();
 }
 TAB_IDS.forEach(id => {
@@ -376,8 +502,14 @@ TAB_IDS.forEach(id => {
     e.preventDefault(); selectTab(TAB_IDS[next], true);
   });
 });
-$('#wkPrev').onclick = () => { weekOff -= 1; renderWeekNav(); renderBudget(); renderReport(); };
-$('#wkNext').onclick = () => { if (weekOff < 0) weekOff += 1; renderWeekNav(); renderBudget(); renderReport(); };
+function shiftPeriod(d) {
+  if (monthMode()) monthOff = Math.min(0, monthOff + d); else weekOff = Math.min(0, weekOff + d);
+  renderWeekNav(); renderBudget(); renderReport();
+}
+$('#wkPrev').onclick = () => shiftPeriod(-1);
+$('#wkNext').onclick = () => shiftPeriod(1);
+$('#pWeek').onclick = () => { per = 'week'; renderWeekNav(); renderReport(); };
+$('#pMonth').onclick = () => { per = 'month'; renderWeekNav(); renderReport(); };
 
 /* ============ Presupuesto y meta ============ */
 $('#bSave').onclick = () => {
@@ -391,7 +523,7 @@ $('#goalForm').addEventListener('submit', e => {
   const msg = $('#goalMsg');
   if (!nombre) return setMsg(msg, 'err', 'Ponle un nombre a tu meta.');
   if (!(objetivo > 0) || objetivo > 1e8) return setMsg(msg, 'err', 'Escribe una meta mayor que 0.');
-  if (!(ahorrado >= 0) || ahorrado > 1e8) return setMsg(msg, 'err', 'El monto ahorrado no es válido.');
+  if (!(ahorrado >= 0) || ahorrado > 1e8) return setMsg(msg, 'err', 'El ahorro inicial no es válido.');
   setMsg(msg, '', '');
   run(() => store.saveGoal({nombre, objetivo: Math.round(objetivo * 100) / 100, ahorrado: Math.round(ahorrado * 100) / 100}), 'Meta guardada');
 });
@@ -401,7 +533,7 @@ $('#gAddBtn').onclick = () => {
   if (!(state.goal.objetivo > 0)) return toast('Primero guarda tu meta.');
   // Se registra como movimiento de ahorro, así tu saldo y tu meta siempre coinciden.
   const mov = {tipo: 'gasto', monto: Math.round(add * 100) / 100, descripcion: ('Ahorro: ' + (state.goal.nombre || 'mi meta')).slice(0, 80), categoria: 'Ahorro', fecha: todayStr()};
-  run(() => addMovs([mov]), 'Ahorro añadido a tu meta').then(ok => { if (ok) $('#gAdd').value = ''; });
+  run(() => store.add([mov]), 'Ahorro añadido a tu meta').then(ok => { if (ok) $('#gAdd').value = ''; });
 };
 
 /* ============ Cuentas ============ */
@@ -511,16 +643,17 @@ $('#btnDeleteAccount').addEventListener('click', async () => {
 /* Importar datos locales al crear cuenta */
 async function offerImport() {
   if (!user || !sb) return;
-  const local = (LS.get('by_movs', []) || []).map(normMov);
+  const local = (LS.get('by_movs', []) || []).map(normMov).filter(m => !m.demo);   // los datos de ejemplo no se importan
   if (!local.length || state.movs.length || LS.get('by_import_declined', false)) return;
   const ok = await confirmBox({title: 'Importar tus datos', text: `Encontramos ${local.length} movimientos guardados en este navegador. ¿Quieres pasarlos a tu cuenta?`, ok: 'Sí, importar'});
   if (!ok) { LS.set('by_import_declined', true); return; }
-  const budget = Number(LS.get('by_budget', 0)) || 0, goal = Object.assign(emptyGoal(), LS.get('by_goal', {}));
+  const budget = Number(LS.get('by_budget', 0)) || 0, goal = Object.assign(emptyGoal(), LS.get('by_goal', {})), lim = objOr(LS.get('by_cat_limits', {}));
   await run(async () => {
-    await store.add(local.map(({tipo, monto, descripcion, categoria, fecha}) => ({tipo, monto, descripcion, categoria, fecha})));
+    await store.add(local.map(cleanMov));
     if (budget > 0) await store.saveBudget(budget);
     if (goal.objetivo > 0) await store.saveGoal(goal);
-    LS.del('by_movs'); LS.del('by_budget'); LS.del('by_goal');
+    if (Object.keys(lim).length) await store.saveCatLimits(lim).catch(err => console.error(err));
+    ['by_movs', 'by_budget', 'by_budget_hist', 'by_cat_limits', 'by_goal'].forEach(k => LS.del(k));
   }, 'Datos importados a tu cuenta');
 }
 
@@ -537,6 +670,20 @@ $('#contactForm').addEventListener('submit', async e => {
   } catch { setMsg(st, 'err', 'No pudimos enviar tu mensaje. Inténtalo de nuevo en un momento.'); }
   finally { btn.disabled = false; }
 });
+
+/* ============ Instalar como app ============ */
+let installEvt = null;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; $('#btnInstall').hidden = false; });
+window.addEventListener('appinstalled', () => { installEvt = null; $('#btnInstall').hidden = true; toast('¡Listo! Balance Young ya está en tu pantalla de inicio.'); });
+$('#btnInstall').onclick = async () => {
+  if (!installEvt) return;
+  installEvt.prompt();
+  try { await installEvt.userChoice; } catch {}
+  installEvt = null; $('#btnInstall').hidden = true;
+};
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(err => console.error(err)));
+}
 
 /* ============ Inicio ============ */
 async function refresh() {
